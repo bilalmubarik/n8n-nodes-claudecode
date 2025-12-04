@@ -288,6 +288,10 @@ export class ClaudeCode implements INodeType {
 				const startTime = Date.now();
 
 				try {
+					if (additionalOptions.debug) {
+						console.log(`[ClaudeCode] Executing query with options:`, JSON.stringify(queryOptions.options, null, 2));
+					}
+
 					for await (const message of query(queryOptions)) {
 						messages.push(message);
 
@@ -319,20 +323,38 @@ export class ClaudeCode implements INodeType {
 					if (outputFormat === 'text') {
 						// Find the result message
 						const resultMessage = messages.find((m) => m.type === 'result') as any;
+						const response: any = {
+							result: String(resultMessage?.result || resultMessage?.error || 'No result available'),
+							success: resultMessage?.subtype === 'success' || false,
+						};
+
+						// Only add metrics if they exist (avoid null values)
+						if (resultMessage?.duration_ms !== undefined) {
+							response.duration_ms = resultMessage.duration_ms;
+						}
+						if (resultMessage?.total_cost_usd !== undefined) {
+							response.total_cost_usd = resultMessage.total_cost_usd;
+						}
+
 						returnData.push({
-							json: {
-								result: resultMessage?.result || resultMessage?.error || '',
-								success: resultMessage?.subtype === 'success',
-								duration_ms: resultMessage?.duration_ms,
-								total_cost_usd: resultMessage?.total_cost_usd,
-							},
+							json: response,
 							pairedItem: itemIndex,
 						});
 					} else if (outputFormat === 'messages') {
-						// Return raw messages
+						// Return raw messages - clean up any null values
+						const cleanMessages = messages.map((msg) => {
+							// Remove null/undefined values from message objects
+							const cleanMsg: any = { type: msg.type };
+							if ((msg as any).message) cleanMsg.message = (msg as any).message;
+							if ((msg as any).result) cleanMsg.result = (msg as any).result;
+							if ((msg as any).error) cleanMsg.error = (msg as any).error;
+							if ((msg as any).subtype) cleanMsg.subtype = (msg as any).subtype;
+							return cleanMsg;
+						});
+
 						returnData.push({
 							json: {
-								messages,
+								messages: cleanMessages,
 								messageCount: messages.length,
 							},
 							pairedItem: itemIndex,
@@ -350,27 +372,42 @@ export class ClaudeCode implements INodeType {
 						) as any;
 						const resultMessage = messages.find((m) => m.type === 'result') as any;
 
-						returnData.push({
-							json: {
-								messages,
-								summary: {
-									userMessageCount: userMessages.length,
-									assistantMessageCount: assistantMessages.length,
-									toolUseCount: toolUses.length,
-									hasResult: !!resultMessage,
-									toolsAvailable: systemInit?.tools || [],
-								},
-								result: resultMessage?.result || resultMessage?.error || null,
-								metrics: resultMessage
-									? {
-											duration_ms: resultMessage.duration_ms,
-											num_turns: resultMessage.num_turns,
-											total_cost_usd: resultMessage.total_cost_usd,
-											usage: resultMessage.usage,
-										}
-									: null,
-								success: resultMessage?.subtype === 'success',
+						// Build the response object, avoiding null values
+						const response: any = {
+							summary: {
+								userMessageCount: userMessages.length,
+								assistantMessageCount: assistantMessages.length,
+								toolUseCount: toolUses.length,
+								hasResult: !!resultMessage,
+								toolsAvailable: systemInit?.tools || [],
 							},
+							success: resultMessage?.subtype === 'success',
+						};
+
+						// Only add result if it exists
+						if (resultMessage?.result) {
+							response.result = resultMessage.result;
+						} else if (resultMessage?.error) {
+							response.error = resultMessage.error;
+						}
+
+						// Only add metrics if they exist
+						if (resultMessage && resultMessage.duration_ms !== undefined) {
+							response.metrics = {
+								duration_ms: resultMessage.duration_ms || 0,
+								num_turns: resultMessage.num_turns || 0,
+								total_cost_usd: resultMessage.total_cost_usd || 0,
+								usage: resultMessage.usage || {},
+							};
+						}
+
+						// Only include messages if debug is enabled (they can be large)
+						if (additionalOptions.debug) {
+							response.messages = messages;
+						}
+
+						returnData.push({
+							json: response,
 							pairedItem: itemIndex,
 						});
 					}
@@ -382,27 +419,49 @@ export class ClaudeCode implements INodeType {
 				const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
 				const isTimeout = error instanceof Error && error.name === 'AbortError';
 
+				// Log detailed error for debugging
+				console.error('[ClaudeCode] Error occurred:', {
+					message: errorMessage,
+					type: error instanceof Error ? error.name : 'unknown',
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+
 				if (this.continueOnFail()) {
 					returnData.push({
 						json: {
 							error: errorMessage,
 							errorType: isTimeout ? 'timeout' : 'execution_error',
-							errorDetails: error instanceof Error ? error.stack : undefined,
+							errorDetails: error instanceof Error ? error.stack : String(error),
 							itemIndex,
+							success: false,
 						},
 						pairedItem: itemIndex,
 					});
 					continue;
 				}
 
-				// Provide more specific error messages
-				const userFriendlyMessage = isTimeout
-					? `Operation timed out after ${timeout} seconds. Consider increasing the timeout in Additional Options.`
-					: `Claude Code execution failed: ${errorMessage}`;
+				// Provide more specific error messages with troubleshooting hints
+				let userFriendlyMessage = '';
+				let description = errorMessage;
+
+				if (isTimeout) {
+					userFriendlyMessage = `Operation timed out after ${timeout} seconds. Consider increasing the timeout in Additional Options.`;
+				} else if (errorMessage.includes('exited with code 1') || errorMessage.includes('spawn') || errorMessage.includes('ENOENT')) {
+					userFriendlyMessage = `Claude Code CLI is not properly installed or configured.`;
+					description = `${errorMessage}\n\nTroubleshooting:\n1. Install Claude CLI: npm install -g @anthropic-ai/claude-code\n2. Authenticate: claude auth\n3. Verify installation: claude --version\n4. Make sure Claude CLI is in the PATH for the n8n user`;
+				} else if (errorMessage.includes('Authentication') || errorMessage.includes('auth')) {
+					userFriendlyMessage = `Claude Code authentication failed.`;
+					description = `${errorMessage}\n\nRun 'claude auth' on your server to authenticate.`;
+				} else if (errorMessage.includes('permission') || errorMessage.includes('EACCES')) {
+					userFriendlyMessage = `Permission denied accessing project path or Claude CLI.`;
+					description = `${errorMessage}\n\nCheck:\n1. Project path exists and is accessible\n2. n8n user has read/write permissions\n3. Claude CLI is accessible to n8n user`;
+				} else {
+					userFriendlyMessage = `Claude Code execution failed: ${errorMessage}`;
+				}
 
 				throw new NodeOperationError(this.getNode(), userFriendlyMessage, {
 					itemIndex,
-					description: errorMessage,
+					description,
 				});
 			}
 		}
